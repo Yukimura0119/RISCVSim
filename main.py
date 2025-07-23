@@ -7,6 +7,7 @@ RANDOM_SEED = 42
 LOCAL_MEMORY_SIZE = 4096
 GLOBAL_MEMORY_SIZE = 16384
 
+
 class TileAddress:
     def __init__(self, base, offset, annotation):
         self.base = base # (x, y)
@@ -96,10 +97,14 @@ class SliceMatmul:
             (n, m),
             annotationRes
         )
+        self.complete_event = None
+        self.tile_id = None
 
     def __str__(self):
         return f"SliceMatmul(m={self.m}, k={self.k}, n={self.n}, addrA={self.addrA}, addrB={self.addrB}, addrRes={self.addrRes})"
 
+    def __repr__(self):
+        return f"SliceMatmul(m={self.m}, k={self.k}, n={self.n}, addrA={self.addrA}, addrB={self.addrB}, addrRes={self.addrRes})"
 
 class Matmul:
     def __init__(self, m, k, n, annotations, tile_size):
@@ -113,7 +118,6 @@ class Matmul:
         self.m_split = self.m_pad // tile_size[0]
         self.n_split = self.n_pad // tile_size[1]
         self.slices = self.create_slices()
-
 
     def create_slices(self):
         slices = []
@@ -144,8 +148,13 @@ class SliceSoftmax:
         self.seqnum = seqnum
         self.addrIn = addrIn # TileAddress
         self.addrRes = addrRes # TileAddress
+        self.complete_event = None
+        self.tile_id = None
 
     def __str__(self):
+        return f"SliceSoftmax(seqnum={self.seqnum}, addrIn={self.addrIn}, addrRes={self.addrRes})"
+
+    def __repr__(self):
         return f"SliceSoftmax(seqnum={self.seqnum}, addrIn={self.addrIn}, addrRes={self.addrRes})"
 
 class Softmax:
@@ -192,6 +201,7 @@ class RISCVTile():
         self.dma_unit = simpy.Resource(env, capacity=1)
         self.noc_unit = simpy.Resource(env, capacity=1)
         self.local_memory = Memory(env, LOCAL_MEMORY_SIZE, init=0)
+        self.task_num = 0
 
     def softmax(self, data):
         pass
@@ -200,90 +210,117 @@ class RISCVTile():
         pass
 
 class RISCVMultiprocessor:
-    def __init__(self, env, num_cores):
+    def __init__(self, env, num_cores, compute_graph):
         self.env = env
         # self.cores = simpy.Resource(env, num_cores)
         self.cores = [RISCVTile(env, i) for i in range(num_cores)]
         self.global_memory = Memory(env, GLOBAL_MEMORY_SIZE, init=0)
+        self.compute_graph = compute_graph
 
+    def search_parent(self, node):
+        parents = list(self.compute_graph.predecessors(node))
+        return parents
+    
     def search_overlap(self, addr):
         overlap_list = []
-        # if global_memory:
-        #     for allocated_addr in self.global_memory.allocate_list:
-        #         overlap_addr = overlap(allocated_addr, addr)
-        #         if overlap_addr:
-        #             overlap_list.append(('global', overlap_addr))
-        #     return overlap_list
         for core in self.cores:
             for allocated_addr in core.local_memory.allocate_list:
                 overlap_addr = overlap(allocated_addr, addr)
                 if overlap_addr:
                     overlap_list.append((core.tile_id, overlap_addr))
-        return overlap_list 
-
+        return overlap_list
 
     def analyze_workload(self, workload):
-        # return a list of memory queries.
-        global_list = ['X', 'Wq', 'Wk', 'Wv']
-        memory_req = []
-        noc_req = []
-        if isinstance(workload, SliceMatmul):
-            if workload.addrA.annotation in global_list:
-                memory_req.append(('global', workload.addrA))
-            else:
-                overlap_listA = self.search_overlap(workload.addrA)
-                if overlap_listA:
-                    noc_req.extend(overlap_listA)
+        parents = self.search_parent(workload)
+        memory_trace = []
+        noc_trace = []
+        if not parents:
+            memory_trace.append(('global', workload.addrA))
+            memory_trace.append(('global', workload.addrB))
+        else:
+            for parent in parents:
+                noc_trace.append(parent)
+        return memory_trace, noc_trace
 
-            if workload.addrB.annotation in global_list:
-                memory_req.append(('global', workload.addrB))
-            else:
-                overlap_listB = self.search_overlap(workload.addrB)
-                if overlap_listB:
-                    noc_req.extend(overlap_listB)
-        elif isinstance(workload, SliceSoftmax):
-            overlap_listIn = self.search_overlap(workload.addrIn)
-            if overlap_listIn:
-                noc_req.extend(overlap_listIn)
-        return memory_req, noc_req
-
+    def schedule(self, noc_trace):
+        core_idx = 0
+        # Q, K, V projections
+        if len(noc_trace) == 0:
+            min_task_num = float('inf')
+            for i, core in enumerate(self.cores):
+                if core.task_num < min_task_num:
+                    min_task_num = core.task_num
+                    core_idx = i
+        else:
+            core_size_map = {}
+            for trace in noc_trace:
+                if trace.tile_id is not None:
+                    core_size_map[trace.tile_id] = core_size_map.get(trace.tile_id, 0) + trace.addrRes.offset[0] * trace.addrRes.offset[1]
+            max_size = 0
+            for i, core in enumerate(self.cores):
+                if core.tile_id in core_size_map:
+                    size = core_size_map[core.tile_id]
+                else:
+                    size = 0
+                if size > max_size:
+                    max_size = size
+                    core_idx = i
+                elif size == max_size:
+                    if core.task_num < self.cores[core_idx].task_num:
+                        core_idx = i
+        return core_idx
+    
     def execute(self, workload): # workload is a slice of a Matmul or Softmax
+        workload.complete_event = self.env.event()
         # Step 0: Analyze the workload
-        memory_req, noc_req = self.analyze_workload(workload)
-        # remove duplicates
-        memory_req = list(set(memory_req))
-        noc_req = list(set(noc_req))
-        # Step 1: schedule the workload to a core
-        core_idx = schedule()
-        for mem_req in memory_req:
-            self.cores[core_idx].local_memory.allocate(mem_req[1])
+
+        memory_trace, noc_trace = self.analyze_workload(workload)
+        for trace in noc_trace:
+            yield trace.complete_event
+
+        core_idx = self.schedule(noc_trace)
+        self.cores[core_idx].task_num += 1
+        
+        for trace in memory_trace:
+
             with self.cores[core_idx].dma_unit.request() as request:
                 yield request
-                print(f"Core {core_idx} accessing memory for {mem_req[1]} at time {self.env.now}")
-                yield self.env.timeout(1)  # Simulate DMA transfer time
-        
-        for noc_req in noc_req:
-            self.cores[core_idx].local_memory.allocate(noc_req[1])
+                if trace[1] in self.cores[core_idx].local_memory.allocate_list:
+                    # print(f"Skipping allocation of {trace[1]} on core {core_idx} at time {self.env.now} as it is already allocated")
+                    continue
+                yield self.env.timeout(50)
+                # print(f"Allocating {trace[1]} on core {core_idx} at time {self.env.now}")
+                self.cores[core_idx].local_memory.allocate(trace[1])
+
+        for trace in noc_trace:
+            if trace.tile_id == core_idx:
+                continue
             with self.cores[core_idx].noc_unit.request() as request:
                 yield request
-                print(f"Core {core_idx} sending data to NoC for {noc_req[1]} at time {self.env.now}")
-                yield self.env.timeout(1)  # Simulate NoC transfer time
+                if trace.addrRes in self.cores[core_idx].local_memory.allocate_list:
+                    # print(f"Skipping transfer of {trace.addrRes} from core {trace.tile_id} to core {core_idx} at time {self.env.now} as it is already allocated")
+                    continue
+                yield self.env.timeout(20)
+                # print(f"Transferring {trace.addrRes} from core {trace.tile_id} to core {core_idx} at time {self.env.now}")
+                self.cores[core_idx].local_memory.allocate(trace.addrRes)
 
-        # compute unit execution
-        self.cores[core_idx].local_memory.allocate(workload.addrRes)
         with self.cores[core_idx].compute_unit.request() as request:
+            workload.state = 'executing'
             yield request
-            print(f"Core {core_idx} executing workload {workload} at time {self.env.now}")
-            yield self.env.timeout(1)
-
-def schedule():
-    core_idx = 0
-    return core_idx
+            yield self.env.timeout(5)
+            workload.state = 'completed'
+            workload.tile_id = core_idx
+            self.cores[core_idx].local_memory.allocate(workload.addrRes)
+            # print(f"Workload {workload} executed on core {core_idx} with tile_id {workload.tile_id} at time {self.env.now}")
+        self.cores[core_idx].task_num -= 1
+        workload.complete_event.succeed()
 
 RANDOM_SEED = 42
 
+
+
 class Attention:
-    def __init__(self, seqlen, dim):
+    def __init__(self, seqlen, dim, config):
         self.seqlen = seqlen
         self.dim = dim
 
@@ -293,21 +330,22 @@ class Attention:
             k=dim, 
             n=dim, 
             annotations={'A': 'X', 'B': 'Wq', 'Res': 'Q'}, 
-            tile_size=(16, 16)
+            # tile_size=(16, 16)
+            tile_size=config.get('proj_q_tile_size', (16, 16))
         )
         self.proj_k = Matmul(
             m=seqlen, 
             k=dim, 
             n=dim, 
             annotations={'A': 'X', 'B': 'Wk', 'Res': 'K'}, 
-            tile_size=(16, 16)
+            tile_size=config.get('proj_k_tile_size', (16, 16))
         )
         self.proj_v = Matmul(
             m=seqlen, 
             k=dim, 
             n=dim, 
             annotations={'A': 'X', 'B': 'Wv', 'Res': 'V'}, 
-            tile_size=(16, 16)
+            tile_size=config.get('proj_v_tile_size', (16, 16))
         )
 
         # QK Matmul
@@ -316,7 +354,7 @@ class Attention:
             k=dim, 
             n=seqlen, 
             annotations={'A': 'Q', 'B': 'K', 'Res': 'QK'}, 
-            tile_size=(16, 16)
+            tile_size=config.get('qk_matmul_tile_size', (16, 16))
         )
 
         # Softmax
@@ -328,7 +366,7 @@ class Attention:
             k=seqlen, 
             n=dim, 
             annotations={'A': 'Softmax', 'B': 'V', 'Res': 'Output'}, 
-            tile_size=(16, 16)
+            tile_size=config.get('qkv_matmul_tile_size', (16, 16))
         )
         self.graph = self.create_graph()
 
@@ -398,41 +436,99 @@ class Attention:
 #     elif annotation == 'Output':
 #         return (base[0] + 700, base[1] + 100)
 
-def main():
-    # TileA = TileAddress((15, 17), (16, 16), 'X')
-    # TileB = TileAddress((15, 15), (16, 16), 'X')
-    # print(overlap(TileA, TileB))  # Should return True
+import time
+
+SEQLEN = 512
+DIM = 512
+
+def evaluation(config):
+    start = time.time()
     env = simpy.Environment()
-    processor = RISCVMultiprocessor(env, num_cores=1)
-    attn = Attention(seqlen=64, dim=64)
+    attn = Attention(seqlen=SEQLEN, dim=DIM, config=config)
+    processor = RISCVMultiprocessor(env, num_cores=config['num_cores'], compute_graph=attn.graph)
     topological_sort = list(nx.topological_sort(attn.graph))
     for node in topological_sort:
-        # print(f"Processing node: {node}")
         env.process(processor.execute(node))
-    env.run(until=1000)
-    # Draw the graph
-    # pos = {
-    #     node: annotation_to_pos(node) for node in attn.graph.nodes()
-    # }
-    # labels = {
-    #     node: node.addrRes.annotation for node in attn.graph.nodes()
-    # }
-    # plt.figure(figsize=(8, 6))
-    # nx.draw(
-    #     attn.graph, pos,
-    #     with_labels=True,
-    #     labels=labels,
-    #     node_size=1000,
-    #     node_color='lightgreen',
-    #     font_size=10,
-    #     font_weight='bold',
-    #     arrows=True,
-    #     arrowsize=20
-    # )
-    # plt.title("DAG with Custom Node Objects")
-    # plt.axis("equal")
-    # plt.grid(True)
+    env.run()
+    end = time.time()
+    return env.now, end - start
+
+def main():
+    tile_sizes = [(16, 16), (32, 32), (48, 48), (64, 64), (80, 80), (96, 96), (112, 112), (128, 128)]
+    num_cores = 8
+    simulation_times = []
+    for tile_size in tile_sizes:
+        config = {
+            'num_cores': num_cores,
+            'proj_q_tile_size': tile_size,
+            'proj_k_tile_size': tile_size,
+            'proj_v_tile_size': tile_size,
+            'qk_matmul_tile_size': tile_size,
+            'qkv_matmul_tile_size': tile_size,
+        }
+        print(f"Running simulation with tile size {tile_size} and {num_cores} cores...")
+        simulation_time, _ = evaluation(config)
+        simulation_times.append((tile_size, simulation_time))
+
+    # draw line chart
+    plt.figure(figsize=(10, 6))
+    plt.plot([size[0][0] for size in simulation_times], [size[1] for size in simulation_times], marker='o')
+    plt.title('Simulation Time vs Tile Size')
+    plt.xlabel('Tile Size (x, y)')
+    plt.ylabel('Simulation Time (seconds)')
+    plt.xticks([size[0][0] for size in simulation_times])
+    plt.grid()
     # plt.show()
+    plt.savefig('simulation_time_vs_tile_size.png')
+
+    tile_size = [(64, 64)]
+    num_cores = [1, 2, 4, 8, 16, 32, 64, 128]
+    simulation_times = []
+    for num_core in num_cores:
+        config = {
+            'num_cores': num_core,
+            'proj_q_tile_size': tile_size[0],
+            'proj_k_tile_size': tile_size[0],
+            'proj_v_tile_size': tile_size[0],
+            'qk_matmul_tile_size': tile_size[0],
+            'qkv_matmul_tile_size': tile_size[0],
+        }
+        print(f"Running simulation with tile size {tile_size[0]} and {num_core} cores...")
+        simulation_time, _ = evaluation(config)
+        simulation_times.append((num_core, simulation_time))
+
+    # draw histogram
+    plt.figure(figsize=(10, 6))
+    plt.bar([str(size[0]) for size in simulation_times], [size[1] for size in simulation_times])
+    plt.title('Simulation Time vs Number of Cores')
+    plt.xlabel('Number of Cores')
+    plt.ylabel('Simulation Time (seconds)')
+    plt.xticks(rotation=45)
+    plt.grid(axis='y')
+    # plt.show()
+    plt.savefig('simulation_time_vs_num_cores.png')
+
+
+    # start = time.time()
+    # config = {
+    #     'num_cores': 64,
+    #     'proj_q_tile_size': (64, 64),
+    #     'proj_k_tile_size': (64, 64),
+    #     'proj_v_tile_size': (64, 64),
+    #     'qk_matmul_tile_size': (64, 64),
+    #     'qkv_matmul_tile_size': (64, 64),
+    # }
+    # env = simpy.Environment()
+    # attn = Attention(seqlen=SEQLEN, dim=DIM, config=config)
+    # processor = RISCVMultiprocessor(env, num_cores=config['num_cores'], compute_graph=attn.graph)
+    # topological_sort = list(nx.topological_sort(attn.graph))
+    # for node in topological_sort:
+    #     env.process(processor.execute(node))
+    # env.run()
+    # end = time.time()
+    # print("Simulation completed.")
+    # print('Time taken:', env.now)
+    # print('Simulation time:', end - start)
 
 if __name__ == "__main__":
     main()
