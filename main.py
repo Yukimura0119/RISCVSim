@@ -1,5 +1,6 @@
 import simpy
 import networkx as nx
+import matplotlib.pyplot as plt
 # import random
 
 RANDOM_SEED = 42
@@ -15,6 +16,9 @@ class TileAddress:
     def __str__(self):
         return f"TileAddress(base={self.base}, offset={self.offset}, annotation={self.annotation})"
     
+    def __repr__(self):
+        return f"TileAddress(base={self.base}, offset={self.offset}, annotation={self.annotation})"
+    
     def __hash__(self):
         return hash((self.base, self.offset, self.annotation))
     
@@ -25,12 +29,60 @@ class TileAddress:
                 self.offset == other.offset and 
                 self.annotation == other.annotation)
 
-def overlap(addrA, addrB):
-    return (addrA.base[0] < addrB.base[0] + addrB.offset[0] and
+def is_overlap(addrA, addrB):
+    if addrA.annotation != addrB.annotation:
+        return False
+    if (addrA.base[0] < addrB.base[0] + addrB.offset[0] and
             addrA.base[0] + addrA.offset[0] > addrB.base[0] and
             addrA.base[1] < addrB.base[1] + addrB.offset[1] and
-            addrA.base[1] + addrA.offset[1] > addrB.base[1] and 
-            addrA.annotation == addrB.annotation)
+            addrA.base[1] + addrA.offset[1] > addrB.base[1]):
+        return True
+    elif (addrB.base[0] < addrA.base[0] + addrA.offset[0] and
+            addrB.base[0] + addrB.offset[0] > addrA.base[0] and
+            addrB.base[1] < addrA.base[1] + addrA.offset[1] and
+            addrB.base[1] + addrB.offset[1] > addrA.base[1]):
+        return True
+    return False
+
+def overlap(addrA, addrB):
+    # return tile addresses overlap if their base coordinates and offsets overlap
+    # otherwise return None 
+    if addrA.annotation != addrB.annotation:
+        return None
+    if (addrA.base[0] < addrB.base[0] + addrB.offset[0] and
+            addrA.base[0] + addrA.offset[0] > addrB.base[0] and
+            addrA.base[1] < addrB.base[1] + addrB.offset[1] and
+            addrA.base[1] + addrA.offset[1] > addrB.base[1]):
+        return TileAddress(
+            (max(addrA.base[0], addrB.base[0]), max(addrA.base[1], addrB.base[1])),
+            (min(addrA.base[0] + addrA.offset[0], addrB.base[0] + addrB.offset[0]) - max(addrA.base[0], addrB.base[0]),
+             min(addrA.base[1] + addrA.offset[1], addrB.base[1] + addrB.offset[1]) - max(addrA.base[1], addrB.base[1])),
+            addrA.annotation
+        )
+    elif (addrB.base[0] < addrA.base[0] + addrA.offset[0] and
+            addrB.base[0] + addrB.offset[0] > addrA.base[0] and
+            addrB.base[1] < addrA.base[1] + addrA.offset[1] and
+            addrB.base[1] + addrB.offset[1] > addrA.base[1]):
+        return TileAddress(
+            (max(addrA.base[0], addrB.base[0]), max(addrA.base[1], addrB.base[1])),
+            (min(addrA.base[0] + addrA.offset[0], addrB.base[0] + addrB.offset[0]) - max(addrA.base[0], addrB.base[0]),
+             min(addrA.base[1] + addrA.offset[1], addrB.base[1] + addrB.offset[1]) - max(addrA.base[1], addrB.base[1])),
+            addrB.annotation
+        )
+    return None
+
+# class MemoryRequest:
+#     def __init__(self, core_idx, type, addr):
+#         self.core_idx = core_idx
+#         self.type = type # e.g. 'load', 'store'
+#         self.addr = addr # TileAddress
+
+# class NoCRequest:
+#     def __init__(self, src_core_idx, dest_core_idx, type, addr):
+#         self.src_core_idx = src_core_idx
+#         self.dest_core_idx = dest_core_idx
+#         self.type = type # e.g. 'unicast'
+#         self.addr = addr # TileAddress
 
 class SliceMatmul:
     def __init__(self, m, k, n, addrA, addrB, annotationRes):
@@ -88,13 +140,13 @@ class Matmul:
         return slices
 
 class SliceSoftmax:
-    def __init__(self, seqnum, addrIn, addrOut):
+    def __init__(self, seqnum, addrIn, addrRes):
         self.seqnum = seqnum
         self.addrIn = addrIn # TileAddress
-        self.addrOut = addrOut # TileAddress
+        self.addrRes = addrRes # TileAddress
 
     def __str__(self):
-        return f"SliceSoftmax(seqnum={self.seqnum}, addrIn={self.addrIn}, addrOut={self.addrOut})"
+        return f"SliceSoftmax(seqnum={self.seqnum}, addrIn={self.addrIn}, addrRes={self.addrRes})"
 
 class Softmax:
     def __init__(self, seqlen):
@@ -109,12 +161,12 @@ class Softmax:
                 (self.seqlen, 1), 
                 'QK'
             )
-            addrOut = TileAddress(
+            addrRes = TileAddress(
                 (0, i), 
                 (self.seqlen, 1), 
                 'Softmax'
             )
-            slice = SliceSoftmax(seqnum=i, addrIn=addrIn, addrOut=addrOut)
+            slice = SliceSoftmax(seqnum=i, addrIn=addrIn, addrRes=addrRes)
             slices.append(slice)
         return slices
         
@@ -125,29 +177,26 @@ class Memory(simpy.Container):
         self.allocate_list = [] # list of TileAddress objects
         self.size = size
 
-    def allocate(self, amount):
-        if amount > self.size:
-            pass
-        yield self.get(amount)
+    def allocate(self, addr):
+        self.get(addr.offset[0] * addr.offset[1])
+        self.allocate_list.append(addr)
 
     def deallocate(self, amount):
         yield self.put(amount)
 
 
-class RISCVTile(simpy.Resource):
+class RISCVTile():
     def __init__(self, env, tile_id):
-        super().__init__(env)
         self.tile_id = tile_id
-        self.local_memory = simpy.Container(env, LOCAL_MEMORY_SIZE, init=LOCAL_MEMORY_SIZE)
+        self.compute_unit = simpy.Resource(env, capacity=1)
+        self.dma_unit = simpy.Resource(env, capacity=1)
+        self.noc_unit = simpy.Resource(env, capacity=1)
+        self.local_memory = Memory(env, LOCAL_MEMORY_SIZE, init=0)
 
     def softmax(self, data):
         pass
 
     def matmul(self, data):
-        pass
-
-    def execute(self, workload):
-        yield self.env.timeout(5)
         pass
 
 class RISCVMultiprocessor:
@@ -155,39 +204,83 @@ class RISCVMultiprocessor:
         self.env = env
         # self.cores = simpy.Resource(env, num_cores)
         self.cores = [RISCVTile(env, i) for i in range(num_cores)]
-        self.global_memory = simpy.Container(env, GLOBAL_MEMORY_SIZE, init=GLOBAL_MEMORY_SIZE)
+        self.global_memory = Memory(env, GLOBAL_MEMORY_SIZE, init=0)
 
-    def softmax(self, data):
-        pass
+    def search_overlap(self, addr):
+        overlap_list = []
+        # if global_memory:
+        #     for allocated_addr in self.global_memory.allocate_list:
+        #         overlap_addr = overlap(allocated_addr, addr)
+        #         if overlap_addr:
+        #             overlap_list.append(('global', overlap_addr))
+        #     return overlap_list
+        for core in self.cores:
+            for allocated_addr in core.local_memory.allocate_list:
+                overlap_addr = overlap(allocated_addr, addr)
+                if overlap_addr:
+                    overlap_list.append((core.tile_id, overlap_addr))
+        return overlap_list 
 
-    def matmul(self, data):
-        pass
 
-    def execute(self, workload):
-        yield self.env.timeout(5)
-        pass
+    def analyze_workload(self, workload):
+        # return a list of memory queries.
+        global_list = ['X', 'Wq', 'Wk', 'Wv']
+        memory_req = []
+        noc_req = []
+        if isinstance(workload, SliceMatmul):
+            if workload.addrA.annotation in global_list:
+                memory_req.append(('global', workload.addrA))
+            else:
+                overlap_listA = self.search_overlap(workload.addrA)
+                if overlap_listA:
+                    noc_req.extend(overlap_listA)
 
-def schedule(env, processor, type):
-    core_idx = 3
+            if workload.addrB.annotation in global_list:
+                memory_req.append(('global', workload.addrB))
+            else:
+                overlap_listB = self.search_overlap(workload.addrB)
+                if overlap_listB:
+                    noc_req.extend(overlap_listB)
+        elif isinstance(workload, SliceSoftmax):
+            overlap_listIn = self.search_overlap(workload.addrIn)
+            if overlap_listIn:
+                noc_req.extend(overlap_listIn)
+        return memory_req, noc_req
+
+    def execute(self, workload): # workload is a slice of a Matmul or Softmax
+        # Step 0: Analyze the workload
+        memory_req, noc_req = self.analyze_workload(workload)
+        # remove duplicates
+        memory_req = list(set(memory_req))
+        noc_req = list(set(noc_req))
+        # Step 1: schedule the workload to a core
+        core_idx = schedule()
+        for mem_req in memory_req:
+            self.cores[core_idx].local_memory.allocate(mem_req[1])
+            with self.cores[core_idx].dma_unit.request() as request:
+                yield request
+                print(f"Core {core_idx} accessing memory for {mem_req[1]} at time {self.env.now}")
+                yield self.env.timeout(1)  # Simulate DMA transfer time
+        
+        for noc_req in noc_req:
+            self.cores[core_idx].local_memory.allocate(noc_req[1])
+            with self.cores[core_idx].noc_unit.request() as request:
+                yield request
+                print(f"Core {core_idx} sending data to NoC for {noc_req[1]} at time {self.env.now}")
+                yield self.env.timeout(1)  # Simulate NoC transfer time
+
+        # compute unit execution
+        self.cores[core_idx].local_memory.allocate(workload.addrRes)
+        with self.cores[core_idx].compute_unit.request() as request:
+            yield request
+            print(f"Core {core_idx} executing workload {workload} at time {self.env.now}")
+            yield self.env.timeout(1)
+
+def schedule():
+    core_idx = 0
     return core_idx
 
-def workload(env, processor, type):
-    # schedule
-    core_idx = schedule(env, processor, type)
-    core = processor.cores[core_idx]
-    with core.request() as request:
-        yield request
-        print(f"Core {core.tile_id} executing workload of type {type} at time {env.now}")
-        yield env.process(core.execute(type))
-
-
 RANDOM_SEED = 42
-
-def merge_graphs(graphA, graphB):
-    merged_graph = nx.DiGraph()
-    merged_graph.add_nodes_from(graphA.nodes(data=True))
-    merged_graph.add_edges_from(graphA.edges(data=True))
-    return merged_graph
 
 class Attention:
     def __init__(self, seqlen, dim):
@@ -242,103 +335,104 @@ class Attention:
     def create_graph(self):
         graph = nx.DiGraph()
         # add q, k, v projections
-        def add_node(addr):
-            if addr not in graph:
-                graph.add_node(addr, label=addr.annotation)
+        def add_node(slice):
+            if slice not in graph:
+                graph.add_node(slice, label=slice.addrRes.annotation)
 
-        def try_add_edge(from_addr, to_addr):
-            add_node(from_addr)
-            add_node(to_addr)
-            graph.add_edge(from_addr, to_addr)
+        def try_add_edge(slice_src, slice_dest):
+            add_node(slice_src)
+            add_node(slice_dest)
+            graph.add_edge(slice_src, slice_dest)
         
         for slice in self.proj_q.slices:
-            try_add_edge(slice.addrA, slice.addrRes)
-            try_add_edge(slice.addrB, slice.addrRes)
+            add_node(slice)
         for slice in self.proj_k.slices:
-            try_add_edge(slice.addrA, slice.addrRes)
-            try_add_edge(slice.addrB, slice.addrRes)
+            add_node(slice)
         for slice in self.proj_v.slices:
-            try_add_edge(slice.addrA, slice.addrRes)
-            try_add_edge(slice.addrB, slice.addrRes)
+            add_node(slice)
 
         for slice in self.qk_matmul.slices:
             nodes = list(graph.nodes)
             for node in nodes:
-                if isinstance(node, TileAddress):
-                    if overlap(node, slice.addrA):
-                        try_add_edge(node, slice.addrRes)
-                    if overlap(node, slice.addrB):
-                        try_add_edge(node, slice.addrRes)
+                if is_overlap(node.addrRes, slice.addrA):
+                    try_add_edge(node, slice)
+                if is_overlap(node.addrRes, slice.addrB):
+                    try_add_edge(node, slice)
 
         for slice in self.qk_softmax.slices:
             nodes = list(graph.nodes)
             for node in nodes:
-                if isinstance(node, TileAddress):
-                    if overlap(node, slice.addrIn):
-                        try_add_edge(node, slice.addrOut)
+                if is_overlap(node.addrRes, slice.addrIn):
+                    try_add_edge(node, slice)
 
         for slice in self.qkv_matmul.slices:
             nodes = list(graph.nodes)
             for node in nodes:
-                if isinstance(node, TileAddress):
-                    if overlap(node, slice.addrA):
-                        try_add_edge(node, slice.addrRes)
-                    if overlap(node, slice.addrB):
-                        try_add_edge(node, slice.addrRes)
+                if is_overlap(node.addrRes, slice.addrA):
+                    try_add_edge(node, slice)
+                if is_overlap(node.addrRes, slice.addrB):
+                    try_add_edge(node, slice)
         return graph
 
-def annotation_to_pos(node):
-    annotation = node.annotation
-    base = node.base + node.offset
-    if annotation == 'X':
-        return (base[0] + 0, base[1] + 0)
-    elif annotation == 'Wq':
-        return (base[0] + 0, base[1] + 100)
-    elif annotation == 'Wk':
-        return (base[0] + 0, base[1] + 200)
-    elif annotation == 'Wv':
-        return (base[0] + 0, base[1] + 300)
-    elif annotation == 'Q':
-        return (base[0] + 100, base[1] + 100)
-    elif annotation == 'K':
-        return (base[0] + 100, base[1] + 200)
-    elif annotation == 'V':
-        return (base[0] + 100, base[1] + 300)
-    elif annotation == 'QK':
-        return (base[0] + 300, base[1] + 100)
-    elif annotation == 'Softmax':
-        return (base[0] + 500, base[1] + 100)
-    elif annotation == 'Output':
-        return (base[0] + 700, base[1] + 100)
+# def annotation_to_pos(node):
+#     annotation = node.addrRes.annotation
+#     base = node.addrRes.base + node.addrRes.offset
+#     if annotation == 'X':
+#         return (base[0] + 0, base[1] + 0)
+#     elif annotation == 'Wq':
+#         return (base[0] + 0, base[1] + 100)
+#     elif annotation == 'Wk':
+#         return (base[0] + 0, base[1] + 200)
+#     elif annotation == 'Wv':
+#         return (base[0] + 0, base[1] + 300)
+#     elif annotation == 'Q':
+#         return (base[0] + 100, base[1] + 100)
+#     elif annotation == 'K':
+#         return (base[0] + 100, base[1] + 200)
+#     elif annotation == 'V':
+#         return (base[0] + 100, base[1] + 300)
+#     elif annotation == 'QK':
+#         return (base[0] + 300, base[1] + 100)
+#     elif annotation == 'Softmax':
+#         return (base[0] + 500, base[1] + 100)
+#     elif annotation == 'Output':
+#         return (base[0] + 700, base[1] + 100)
 
-import matplotlib.pyplot as plt
 def main():
+    # TileA = TileAddress((15, 17), (16, 16), 'X')
+    # TileB = TileAddress((15, 15), (16, 16), 'X')
+    # print(overlap(TileA, TileB))  # Should return True
+    env = simpy.Environment()
+    processor = RISCVMultiprocessor(env, num_cores=1)
     attn = Attention(seqlen=64, dim=64)
-    pos = {
-        # X -> +100
-        # Wq -> +200
-        # node: node.base for node in attn.graph.nodes()
-        node: annotation_to_pos(node) for node in attn.graph.nodes()
-    }
-    labels = {
-        node: node.annotation for node in attn.graph.nodes()
-    }
-    plt.figure(figsize=(8, 6))
-    nx.draw(
-        attn.graph, pos,
-        with_labels=True,
-        labels=labels,
-        node_size=1000,
-        node_color='lightgreen',
-        font_size=10,
-        font_weight='bold',
-        arrows=True,
-        arrowsize=20
-    )
-    plt.title("DAG with Custom Node Objects")
-    plt.axis("equal")
-    plt.grid(True)
-    plt.show()
+    topological_sort = list(nx.topological_sort(attn.graph))
+    for node in topological_sort:
+        # print(f"Processing node: {node}")
+        env.process(processor.execute(node))
+    env.run(until=1000)
+    # Draw the graph
+    # pos = {
+    #     node: annotation_to_pos(node) for node in attn.graph.nodes()
+    # }
+    # labels = {
+    #     node: node.addrRes.annotation for node in attn.graph.nodes()
+    # }
+    # plt.figure(figsize=(8, 6))
+    # nx.draw(
+    #     attn.graph, pos,
+    #     with_labels=True,
+    #     labels=labels,
+    #     node_size=1000,
+    #     node_color='lightgreen',
+    #     font_size=10,
+    #     font_weight='bold',
+    #     arrows=True,
+    #     arrowsize=20
+    # )
+    # plt.title("DAG with Custom Node Objects")
+    # plt.axis("equal")
+    # plt.grid(True)
+    # plt.show()
 
 if __name__ == "__main__":
     main()
