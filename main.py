@@ -72,18 +72,20 @@ def overlap(addrA, addrB):
         )
     return None
 
-# class MemoryRequest:
-#     def __init__(self, core_idx, type, addr):
-#         self.core_idx = core_idx
-#         self.type = type # e.g. 'load', 'store'
-#         self.addr = addr # TileAddress
+class MemoryRequest:
+    def __init__(self, time, core_idx, type, addr):
+        self.time = time
+        self.core_idx = core_idx
+        self.type = type # e.g. 'load', 'store'
+        self.addr = addr # TileAddress
 
-# class NoCRequest:
-#     def __init__(self, src_core_idx, dest_core_idx, type, addr):
-#         self.src_core_idx = src_core_idx
-#         self.dest_core_idx = dest_core_idx
-#         self.type = type # e.g. 'unicast'
-#         self.addr = addr # TileAddress
+class NoCRequest:
+    def __init__(self, time, src_core_idx, dest_core_idx, type, addr):
+        self.time = time
+        self.src_core_idx = src_core_idx
+        self.dest_core_idx = dest_core_idx
+        self.type = type # e.g. 'unicast'
+        self.addr = addr # TileAddress
 
 class SliceMatmul:
     def __init__(self, m, k, n, addrA, addrB, annotationRes):
@@ -194,6 +196,7 @@ class Memory(simpy.Container):
         yield self.put(amount)
 
 
+
 class RISCVTile():
     def __init__(self, env, tile_id):
         self.tile_id = tile_id
@@ -203,11 +206,8 @@ class RISCVTile():
         self.local_memory = Memory(env, LOCAL_MEMORY_SIZE, init=0)
         self.task_num = 0
 
-    def softmax(self, data):
-        pass
-
-    def matmul(self, data):
-        pass
+memory_req_trace = []
+noc_req_trace = []
 
 class RISCVMultiprocessor:
     def __init__(self, env, num_cores, compute_graph):
@@ -288,6 +288,7 @@ class RISCVMultiprocessor:
                 if trace[1] in self.cores[core_idx].local_memory.allocate_list:
                     # print(f"Skipping allocation of {trace[1]} on core {core_idx} at time {self.env.now} as it is already allocated")
                     continue
+                memory_req_trace.append(MemoryRequest(self.env.now, core_idx, 'load', trace[1]))
                 yield self.env.timeout(50)
                 # print(f"Allocating {trace[1]} on core {core_idx} at time {self.env.now}")
                 self.cores[core_idx].local_memory.allocate(trace[1])
@@ -301,6 +302,7 @@ class RISCVMultiprocessor:
                     # print(f"Skipping transfer of {trace.addrRes} from core {trace.tile_id} to core {core_idx} at time {self.env.now} as it is already allocated")
                     continue
                 yield self.env.timeout(20)
+                noc_req_trace.append(NoCRequest(self.env.now, trace.tile_id, core_idx, 'unicast', trace.addrRes))
                 # print(f"Transferring {trace.addrRes} from core {trace.tile_id} to core {core_idx} at time {self.env.now}")
                 self.cores[core_idx].local_memory.allocate(trace.addrRes)
 
@@ -311,13 +313,13 @@ class RISCVMultiprocessor:
             workload.state = 'completed'
             workload.tile_id = core_idx
             self.cores[core_idx].local_memory.allocate(workload.addrRes)
+            if workload.addrRes.annotation == 'Output':
+                memory_req_trace.append(MemoryRequest(self.env.now, core_idx, 'store', workload.addrRes))
             # print(f"Workload {workload} executed on core {core_idx} with tile_id {workload.tile_id} at time {self.env.now}")
         self.cores[core_idx].task_num -= 1
         workload.complete_event.succeed()
 
 RANDOM_SEED = 42
-
-
 
 class Attention:
     def __init__(self, seqlen, dim, config):
@@ -454,81 +456,84 @@ def evaluation(config):
     return env.now, end - start
 
 def main():
-    tile_sizes = [(16, 16), (32, 32), (48, 48), (64, 64), (80, 80), (96, 96), (112, 112), (128, 128)]
-    num_cores = 8
-    simulation_times = []
-    for tile_size in tile_sizes:
-        config = {
-            'num_cores': num_cores,
-            'proj_q_tile_size': tile_size,
-            'proj_k_tile_size': tile_size,
-            'proj_v_tile_size': tile_size,
-            'qk_matmul_tile_size': tile_size,
-            'qkv_matmul_tile_size': tile_size,
-        }
-        print(f"Running simulation with tile size {tile_size} and {num_cores} cores...")
-        simulation_time, _ = evaluation(config)
-        simulation_times.append((tile_size, simulation_time))
+    tile_size = (64, 64)
+    num_cores = 4
+    config = {
+        'num_cores': num_cores,
+        'proj_q_tile_size': tile_size,
+        'proj_k_tile_size': tile_size,
+        'proj_v_tile_size': tile_size,
+        'qk_matmul_tile_size': tile_size,
+        'qkv_matmul_tile_size': tile_size,
+    }
+    print(f"Running simulation with tile size {tile_size} and {num_cores} cores...")
+    simulation_time, elapsed_time = evaluation(config)
+    print(f"Simulation time: {simulation_time}, Elapsed time: {elapsed_time}")
+    print(f"Memory Requests: {len(memory_req_trace)}")
+    print(f"NoC Requests: {len(noc_req_trace)}")
+    # Dump memory and NoC request traces
+    with open('memory_trace.csv', 'w') as f:
+        f.write('time,core_idx,type,data,base1,base2,offset1,offset2\n')
+        for req in memory_req_trace:
+            f.write(f"{req.time},{req.core_idx},{req.type},{req.addr.annotation},{req.addr.base[0]},{req.addr.base[1]},{req.addr.offset[0]},{req.addr.offset[1]}\n")
+    with open('noc_trace.csv', 'w') as f:
+        f.write('time,src_core_idx,dest_core_idx,type,data,base1,base2,offset1,offset2\n')
+        for req in noc_req_trace:
+            f.write(f"{req.time},{req.src_core_idx},{req.dest_core_idx},{req.type},{req.addr.annotation},{req.addr.base[0]},{req.addr.base[1]},{req.addr.offset[0]},{req.addr.offset[1]}\n")
+    # tile_sizes = [(16, 16), (32, 32), (48, 48), (64, 64), (80, 80), (96, 96), (112, 112), (128, 128)]
+    # num_cores = 8
+    # simulation_times = []
+    # for tile_size in tile_sizes:
+    #     config = {
+    #         'num_cores': num_cores,
+    #         'proj_q_tile_size': tile_size,
+    #         'proj_k_tile_size': tile_size,
+    #         'proj_v_tile_size': tile_size,
+    #         'qk_matmul_tile_size': tile_size,
+    #         'qkv_matmul_tile_size': tile_size,
+    #     }
+    #     print(f"Running simulation with tile size {tile_size} and {num_cores} cores...")
+    #     simulation_time, _ = evaluation(config)
+    #     simulation_times.append((tile_size, simulation_time))
 
-    # draw line chart
-    plt.figure(figsize=(10, 6))
-    plt.plot([size[0][0] for size in simulation_times], [size[1] for size in simulation_times], marker='o')
-    plt.title('Simulation Time vs Tile Size')
-    plt.xlabel('Tile Size (x, y)')
-    plt.ylabel('Simulation Time (seconds)')
-    plt.xticks([size[0][0] for size in simulation_times])
-    plt.grid()
-    # plt.show()
-    plt.savefig('simulation_time_vs_tile_size.png')
+    # # draw line chart
+    # plt.figure(figsize=(10, 6))
+    # plt.plot([size[0][0] for size in simulation_times], [size[1] for size in simulation_times], marker='o')
+    # plt.title('Simulation Time vs Tile Size')
+    # plt.xlabel('Tile Size (x, y)')
+    # plt.ylabel('Simulation Time (seconds)')
+    # plt.xticks([size[0][0] for size in simulation_times])
+    # plt.grid()
+    # # plt.show()
+    # plt.savefig('simulation_time_vs_tile_size.png')
 
-    tile_size = [(64, 64)]
-    num_cores = [1, 2, 4, 8, 16, 32, 64, 128]
-    simulation_times = []
-    for num_core in num_cores:
-        config = {
-            'num_cores': num_core,
-            'proj_q_tile_size': tile_size[0],
-            'proj_k_tile_size': tile_size[0],
-            'proj_v_tile_size': tile_size[0],
-            'qk_matmul_tile_size': tile_size[0],
-            'qkv_matmul_tile_size': tile_size[0],
-        }
-        print(f"Running simulation with tile size {tile_size[0]} and {num_core} cores...")
-        simulation_time, _ = evaluation(config)
-        simulation_times.append((num_core, simulation_time))
+    # tile_size = [(64, 64)]
+    # num_cores = [1, 2, 4, 8, 16, 32, 64, 128]
+    # simulation_times = []
+    # for num_core in num_cores:
+    #     config = {
+    #         'num_cores': num_core,
+    #         'proj_q_tile_size': tile_size[0],
+    #         'proj_k_tile_size': tile_size[0],
+    #         'proj_v_tile_size': tile_size[0],
+    #         'qk_matmul_tile_size': tile_size[0],
+    #         'qkv_matmul_tile_size': tile_size[0],
+    #     }
+    #     print(f"Running simulation with tile size {tile_size[0]} and {num_core} cores...")
+    #     simulation_time, _ = evaluation(config)
+    #     simulation_times.append((num_core, simulation_time))
 
-    # draw histogram
-    plt.figure(figsize=(10, 6))
-    plt.bar([str(size[0]) for size in simulation_times], [size[1] for size in simulation_times])
-    plt.title('Simulation Time vs Number of Cores')
-    plt.xlabel('Number of Cores')
-    plt.ylabel('Simulation Time (seconds)')
-    plt.xticks(rotation=45)
-    plt.grid(axis='y')
-    # plt.show()
-    plt.savefig('simulation_time_vs_num_cores.png')
+    # # draw histogram
+    # plt.figure(figsize=(10, 6))
+    # plt.bar([str(size[0]) for size in simulation_times], [size[1] for size in simulation_times])
+    # plt.title('Simulation Time vs Number of Cores')
+    # plt.xlabel('Number of Cores')
+    # plt.ylabel('Simulation Time (seconds)')
+    # plt.xticks(rotation=45)
+    # plt.grid(axis='y')
+    # # plt.show()
+    # plt.savefig('simulation_time_vs_num_cores.png')
 
-
-    # start = time.time()
-    # config = {
-    #     'num_cores': 64,
-    #     'proj_q_tile_size': (64, 64),
-    #     'proj_k_tile_size': (64, 64),
-    #     'proj_v_tile_size': (64, 64),
-    #     'qk_matmul_tile_size': (64, 64),
-    #     'qkv_matmul_tile_size': (64, 64),
-    # }
-    # env = simpy.Environment()
-    # attn = Attention(seqlen=SEQLEN, dim=DIM, config=config)
-    # processor = RISCVMultiprocessor(env, num_cores=config['num_cores'], compute_graph=attn.graph)
-    # topological_sort = list(nx.topological_sort(attn.graph))
-    # for node in topological_sort:
-    #     env.process(processor.execute(node))
-    # env.run()
-    # end = time.time()
-    # print("Simulation completed.")
-    # print('Time taken:', env.now)
-    # print('Simulation time:', end - start)
 
 if __name__ == "__main__":
     main()
