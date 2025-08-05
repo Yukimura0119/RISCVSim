@@ -573,94 +573,117 @@ def evaluation(config):
     end = time.time()
     return env.now, end - start
 
-def draw_gantt_graph(tile_size):
+import json
+
+
+def draw_gantt_graph(tile_size, num_tiles, method):
     global memory_record, compute_record, noc_record
 
-    for tile_idx in range(8):
-        fig = plt.figure(figsize=(13, 6))
-        ax = fig.add_subplot(111)
+    events = []
+
+    for tile_idx in range(num_tiles):
+        # fig = plt.figure(figsize=(13, 6))
+        # ax = fig.add_subplot(111)
         core_compute_trace = [trace for trace in compute_record if trace.tile_idx == tile_idx]
         core_memory_trace = [trace for trace in memory_record if trace.tile_idx == tile_idx]
         core_noc_trace = [trace for trace in noc_record if trace.dest_tile_idx == tile_idx]
+        
         for trace in core_compute_trace:
+            event_dict = {"cat": f'{trace.workload.addrRes}', "ph": "X", "ts": trace.start_time*1e6, "pid": tile_idx, "tid": "Compute Unit", "dur": (trace.end_time - trace.start_time) * 1e6}
             if trace.workload.addrRes.annotation == 'Output':
-                ax.barh(0, trace.end_time - trace.start_time, left=trace.start_time, color='blue', label='Softmax(QK^T)*V' if trace == core_compute_trace[0] else "")
+                event_dict["name"] = "Output"
+                # ax.barh(0, trace.end_time - trace.start_time, left=trace.start_time, color='blue', label='Softmax(QK^T)*V' if trace == core_compute_trace[0] else "")
             elif trace.workload.addrRes.annotation == 'QK':
-                ax.barh(0, trace.end_time - trace.start_time, left=trace.start_time, color='red', label='QK^T' if trace == core_compute_trace[0] else "")
+                event_dict["name"] = "QK^T"
+                # ax.barh(0, trace.end_time - trace.start_time, left=trace.start_time, color='red', label='QK^T' if trace == core_compute_trace[0] else "")
             elif trace.workload.addrRes.annotation == 'Softmax':
-                ax.barh(0, trace.end_time - trace.start_time, left=trace.start_time, color='purple', label='Softmax' if trace == core_compute_trace[0] else "")
+                event_dict["name"] = "Softmax"
+                # ax.barh(0, trace.end_time - trace.start_time, left=trace.start_time, color='purple', label='Softmax' if trace == core_compute_trace[0] else "")
             elif trace.workload.addrRes.annotation == 'Q':
-                ax.barh(0, trace.end_time - trace.start_time, left=trace.start_time, color='darkcyan', label='Q Projection' if trace == core_compute_trace[0] else "")
+                event_dict["name"] = "Q Projection"
+                # a.barh(0, trace.end_time - trace.start_time, left=trace.start_time, color='darkcyan', label='Q Projection' if trace == core_compute_trace[0] else "")
             elif trace.workload.addrRes.annotation == 'K':
-                ax.barh(0, trace.end_time - trace.start_time, left=trace.start_time, color='darkmagenta', label='K Projection' if trace == core_compute_trace[0] else "")
+                event_dict["name"] = "K Projection"
+                # ax.barh(0, trace.end_time - trace.start_time, left=trace.start_time, color='darkmagenta', label='K Projection' if trace == core_compute_trace[0] else "")
             elif trace.workload.addrRes.annotation == 'V':
-                ax.barh(0, trace.end_time - trace.start_time, left=trace.start_time, color='darkviolet', label='V Projection' if trace == core_compute_trace[0] else "")
+                event_dict["name"] = "V Projection"
+            events.append(event_dict)
+                # ax.barh(0, trace.end_time - trace.start_time, left=trace.start_time, color='darkviolet', label='V Projection' if trace == core_compute_trace[0] else "")
         for trace in core_memory_trace:
-            ax.barh(1, trace.end_time - trace.start_time, left=trace.start_time, color='green', label='Memory' if trace == core_memory_trace[0] else "")
+            event_dict = {"cat": f'{trace.addr}', "ph": "X", "ts": trace.start_time*1e6, "pid": tile_idx, "tid": "Memory Unit", "dur": (trace.end_time - trace.start_time) * 1e6}
+            # ax.barh(1, trace.end_time - trace.start_time, left=trace.start_time, color='green', label='Memory' if trace == core_memory_trace[0] else "")
+            if trace.type == 'load':
+                event_dict["name"] = "Load"
+            elif trace.type == 'store':
+                event_dict["name"] = "Store"
+            events.append(event_dict)
         for trace in core_noc_trace:
-            ax.barh(2, trace.end_time - trace.start_time, left=trace.start_time, color='orange', label='NoC' if trace == core_noc_trace[0] else "")
-        ax.set_xlabel('Time')
-        # ax.set_xlim(left=0, right=4000)
-        ax.set_ylabel('Core')
-        ax.set_title(f'Gantt Chart of Core {tile_idx} Execution')
-        ax.set_yticks([0, 1, 2])
-        ax.set_yticklabels([f'Core {tile_idx} - Compute', f'Core {tile_idx} - Memory', f'Core {tile_idx} - NoC'])
-        ax.legend(handles=[plt.Line2D([0], [0], color='blue', lw=4),
-                           plt.Line2D([0], [0], color='red', lw=4),
-                           plt.Line2D([0], [0], color='purple', lw=4),
-                           plt.Line2D([0], [0], color='darkcyan', lw=4),
-                           plt.Line2D([0], [0], color='darkmagenta', lw=4),
-                           plt.Line2D([0], [0], color='darkviolet', lw=4),
-                           plt.Line2D([0], [0], color='green', lw=4),
-                           plt.Line2D([0], [0], color='orange', lw=4)],
-                  labels=['Softmax(QK^T)*V', 'QK^T', 'Softmax', 'Q Projection', 'K Projection', 'V Projection', 'Memory', 'NoC'], loc='upper left')
-        plt.tight_layout()
-        plt.savefig(f'gantt_chart_{tile_size[0]}_{tile_size[1]}_core_{tile_idx}.png')
-        plt.close(fig)
+            event_dict = {"name":"unicast", "cat": f'{trace.src_tile_idx}->{trace.dest_tile_idx}_{trace.addr}', "ph": "X", "ts": trace.start_time*1e6, "pid": tile_idx, "tid": "NoC Unit", "dur": (trace.end_time - trace.start_time) * 1e6}
+            events.append(event_dict)
+        json.dump(events, open(f'trace_{tile_size[0]}_{tile_size[1]}_{num_tiles}_{method}.json', 'w'), indent=4)
+            # ax.barh(2, trace.end_time - trace.start_time, left=trace.start_time, color='orange', label='NoC' if trace == core_noc_trace[0] else "")
+        # ax.set_xlabel('Time')
+        # # ax.set_xlim(left=0, right=4000)
+        # ax.set_ylabel('Core')
+        # ax.set_title(f'Gantt Chart of Core {tile_idx} Execution')
+        # ax.set_yticks([0, 1, 2])
+        # ax.set_yticklabels([f'Core {tile_idx} - Compute', f'Core {tile_idx} - Memory', f'Core {tile_idx} - NoC'])
+        # ax.legend(handles=[plt.Line2D([0], [0], color='blue', lw=4),
+        #                    plt.Line2D([0], [0], color='red', lw=4),
+        #                    plt.Line2D([0], [0], color='purple', lw=4),
+        #                    plt.Line2D([0], [0], color='darkcyan', lw=4),
+        #                    plt.Line2D([0], [0], color='darkmagenta', lw=4),
+        #                    plt.Line2D([0], [0], color='darkviolet', lw=4),
+        #                    plt.Line2D([0], [0], color='green', lw=4),
+        #                    plt.Line2D([0], [0], color='orange', lw=4)],
+        #           labels=['Softmax(QK^T)*V', 'QK^T', 'Softmax', 'Q Projection', 'K Projection', 'V Projection', 'Memory', 'NoC'], loc='upper left')
+        # plt.tight_layout()
+        # plt.savefig(f'gantt_chart_{tile_size[0]}_{tile_size[1]}_core_{tile_idx}.png')
+        # plt.close(fig)
 
 def main():
     global memory_record, noc_record, compute_record
-    # tile_sizes = [(16, 64), (24, 64), (32, 64), (40, 64), (48, 64), (56, 64), (64, 64)]
-    # num_tiles = 8
-    # num_core = 1
-    # schedule_methods = ['min_idle', 'min_traffic']
-    # # schedule_methods = ['min_traffic']
-    # plt.figure(figsize=(10, 6))
-    # for schedule_method in schedule_methods:
-    #     simulation_times = []
-    #     for tile_size in tile_sizes:
-    #         config = {
-    #             'num_tiles': num_tiles,
-    #             'proj_q_tile_size': tile_size,
-    #             'proj_q_core_num': num_core,
-    #             'proj_k_tile_size': tile_size,
-    #             'proj_k_core_num': num_core,
-    #             'proj_v_tile_size': tile_size,
-    #             'proj_v_core_num': num_core,
-    #             'qk_matmul_tile_size': tile_size,
-    #             'qk_matmul_core_num': num_core,
-    #             'qkv_matmul_tile_size': tile_size,
-    #             'qkv_matmul_core_num': num_core,
-    #             'softmax_core_num': num_core,
-    #             'schedule_method':  schedule_method  # or 'min_idle'
-    #         }
-    #         print(f"Running simulation with tile size {tile_size} and {num_tiles} tiles...")
-    #         simulation_time, _ = evaluation(config)
-    #         simulation_times.append((tile_size, simulation_time))
-    #         # draw_gantt_graph(tile_size)
-    #         memory_record = []
-    #         compute_record = []
-    #         noc_record = []
+    tile_sizes = [(16, 64), (24, 64), (32, 64), (40, 64), (48, 64), (56, 64), (64, 64)]
+    num_tiles = 8
+    num_core = 1
+    schedule_methods = ['min_idle', 'min_traffic']
+    # schedule_methods = ['min_traffic']
+    plt.figure(figsize=(10, 6))
+    for schedule_method in schedule_methods:
+        simulation_times = []
+        for tile_size in tile_sizes:
+            config = {
+                'num_tiles': num_tiles,
+                'proj_q_tile_size': tile_size,
+                'proj_q_core_num': num_core,
+                'proj_k_tile_size': tile_size,
+                'proj_k_core_num': num_core,
+                'proj_v_tile_size': tile_size,
+                'proj_v_core_num': num_core,
+                'qk_matmul_tile_size': tile_size,
+                'qk_matmul_core_num': num_core,
+                'qkv_matmul_tile_size': tile_size,
+                'qkv_matmul_core_num': num_core,
+                'softmax_core_num': num_core,
+                'schedule_method':  schedule_method  # or 'min_idle'
+            }
+            print(f"Running simulation with tile size {tile_size} and {num_tiles} tiles...")
+            simulation_time, _ = evaluation(config)
+            simulation_times.append((tile_size, simulation_time))
+            draw_gantt_graph(tile_size, num_tiles, schedule_method)
+            memory_record = []
+            compute_record = []
+            noc_record = []
 
-    #     plt.plot([size[0][0] for size in simulation_times], [size[1] for size in simulation_times], marker='o', label=f'Schedule: {schedule_method}')
+        plt.plot([size[0][0] for size in simulation_times], [size[1] for size in simulation_times], marker='o', label=f'Schedule: {schedule_method}')
 
-    # plt.title('Simulation Time vs Tile Size')
-    # plt.xlabel('Tile Size (x, y)')
-    # plt.ylabel('Simulation Time (seconds)')
-    # plt.xticks([size[0][0] for size in simulation_times])
-    # plt.legend()
-    # plt.grid()
-    # plt.savefig('simulation_time_vs_tile_size.png')
+    plt.title('Simulation Time vs Tile Size')
+    plt.xlabel('Tile Size (x, y)')
+    plt.ylabel('Simulation Time (seconds)')
+    plt.xticks([size[0][0] for size in simulation_times])
+    plt.legend()
+    plt.grid()
+    plt.savefig('simulation_time_vs_tile_size.png')
 
     # tile_sizes = [(16, 64), (24, 64), (32, 64), (40, 64), (48, 64), (56, 64), (64, 64)]
     # num_tiles = 8
@@ -707,40 +730,40 @@ def main():
     # plt.savefig('simulation_time_vs_num_cores.png')
 
 
-    tile_size = [(32, 64)]
-    num_cores = [1, 2, 4, 8, 16, 32, 64, 128]
-    simulation_times = []
-    num_core = 1
-    for num_tile in num_cores:
-        config = {
-            'num_tiles': num_tile,
-            'proj_q_tile_size': tile_size[0],
-            'proj_q_core_num': num_core,
-            'proj_k_tile_size': tile_size[0],
-            'proj_k_core_num': num_core,
-            'proj_v_tile_size': tile_size[0],
-            'proj_v_core_num': num_core,
-            'qk_matmul_tile_size': tile_size[0],
-            'qk_matmul_core_num': num_core,
-            'qkv_matmul_tile_size': tile_size[0],
-            'qkv_matmul_core_num': num_core,
-            'softmax_core_num': num_core,
-            'schedule_method': 'min_traffic'
-        }
-        print(f"Running simulation with tile size {tile_size[0]} and {num_tile} tiles...")
-        simulation_time, _ = evaluation(config)
-        simulation_times.append((num_tile, simulation_time))
+    # tile_size = [(32, 64)]
+    # num_cores = [1, 2, 4, 8, 16, 32, 64, 128]
+    # simulation_times = []
+    # num_core = 1
+    # for num_tile in num_cores:
+    #     config = {
+    #         'num_tiles': num_tile,
+    #         'proj_q_tile_size': tile_size[0],
+    #         'proj_q_core_num': num_core,
+    #         'proj_k_tile_size': tile_size[0],
+    #         'proj_k_core_num': num_core,
+    #         'proj_v_tile_size': tile_size[0],
+    #         'proj_v_core_num': num_core,
+    #         'qk_matmul_tile_size': tile_size[0],
+    #         'qk_matmul_core_num': num_core,
+    #         'qkv_matmul_tile_size': tile_size[0],
+    #         'qkv_matmul_core_num': num_core,
+    #         'softmax_core_num': num_core,
+    #         'schedule_method': 'min_traffic'
+    #     }
+    #     print(f"Running simulation with tile size {tile_size[0]} and {num_tile} tiles...")
+    #     simulation_time, _ = evaluation(config)
+    #     simulation_times.append((num_tile, simulation_time))
 
-    # draw histogram
-    plt.figure(figsize=(10, 6))
-    plt.bar([str(size[0]) for size in simulation_times], [size[1] for size in simulation_times])
-    plt.title('Simulation Time vs Number of Tiles')
-    plt.xlabel('Number of Tiles')
-    plt.ylabel('Simulation Time (seconds)')
-    plt.xticks(rotation=45)
-    plt.grid(axis='y')
-    # plt.show()
-    plt.savefig('simulation_time_vs_num_tiles.png')
+    # # draw histogram
+    # plt.figure(figsize=(10, 6))
+    # plt.bar([str(size[0]) for size in simulation_times], [size[1] for size in simulation_times])
+    # plt.title('Simulation Time vs Number of Tiles')
+    # plt.xlabel('Number of Tiles')
+    # plt.ylabel('Simulation Time (seconds)')
+    # plt.xticks(rotation=45)
+    # plt.grid(axis='y')
+    # # plt.show()
+    # plt.savefig('simulation_time_vs_num_tiles.png')
 
 
 if __name__ == "__main__":
