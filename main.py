@@ -8,8 +8,35 @@ RANDOM_SEED = 42
 LOCAL_MEMORY_SIZE = 4096
 GLOBAL_MEMORY_SIZE = 16384
 
-gemm_table = pd.read_csv('gemm_4cores_0729_filtered.csv')
-softmax_table = pd.read_csv('softmax_4.csv')
+TABLE_PATH = './compute_tables/'
+gemm_tables = [pd.read_csv(TABLE_PATH + 'gemm_1Cores_0802.csv'), pd.read_csv(TABLE_PATH + 'gemm_2Cores_0802.csv'), 
+               pd.read_csv(TABLE_PATH + 'gemm_4Cores_0802.csv')]
+softmax_tables = [pd.read_csv(TABLE_PATH + 'softmax_compute_1.csv'), pd.read_csv(TABLE_PATH + 'softmax_compute_2.csv'),
+                  pd.read_csv(TABLE_PATH + 'softmax_compute_4.csv')]
+
+def get_gemm_compute_time(m, n, k, num_cores):
+    if num_cores == 1:
+        table = gemm_tables[0]
+    elif num_cores == 2:
+        table = gemm_tables[1]
+    elif num_cores == 4:
+        table = gemm_tables[2]
+    else:
+        raise ValueError("Unsupported number of cores")
+    compute_time = table[(table['Mc'] == m) & (table['Nc'] == n) & (table['Kc'] == k)]['op_time'].values[0]
+    return compute_time
+
+def get_softmax_compute_time(input_size, num_cores):
+    if num_cores == 1:
+        table = softmax_tables[0]
+    elif num_cores == 2:
+        table = softmax_tables[1]
+    elif num_cores == 4:
+        table = softmax_tables[2]
+    else:
+        raise ValueError("Unsupported number of cores")
+    compute_time = table[table['input_size'] == input_size]['compute_time(nsec)'].values[0] / 1e9
+    return compute_time
 
 class TileAddress:
     def __init__(self, base, offset, annotation):
@@ -76,27 +103,27 @@ def overlap(addrA, addrB):
     return None
 
 class MemoryTrace:
-    def __init__(self, start_time, end_time, core_idx, type, addr):
+    def __init__(self, start_time, end_time, tile_idx, type, addr):
         self.start_time = start_time
         self.end_time = end_time
-        self.core_idx = core_idx
+        self.tile_idx = tile_idx
         self.type = type # e.g. 'load', 'store'
         self.addr = addr # TileAddress
 
 class NoCTrace:
-    def __init__(self, start_time, end_time, src_core_idx, dest_core_idx, type, addr):
+    def __init__(self, start_time, end_time, src_tile_idx, dest_tile_idx, type, addr):
         self.start_time = start_time
         self.end_time = end_time
-        self.src_core_idx = src_core_idx
-        self.dest_core_idx = dest_core_idx
+        self.src_tile_idx = src_tile_idx
+        self.dest_tile_idx = dest_tile_idx
         self.type = type # e.g. 'unicast'
         self.addr = addr # TileAddress
 
 class ComputeTrace:
-    def __init__(self, start_time, end_time, core_idx, workload):
+    def __init__(self, start_time, end_time, tile_idx, workload):
         self.start_time = start_time
         self.end_time = end_time
-        self.core_idx = core_idx
+        self.tile_idx = tile_idx
         self.workload = workload
 
 class SliceMatmul:
@@ -244,9 +271,9 @@ compute_record = []
 noc_record = []
 
 class RISCVMultiprocessor:
-    def __init__(self, env, num_cores, schedule_method, compute_graph):
+    def __init__(self, env, num_tiles, schedule_method, compute_graph):
         self.env = env
-        self.cores = [RISCVTile(env, i) for i in range(num_cores)]
+        self.tiles = [RISCVTile(env, i) for i in range(num_tiles)]
         self.global_memory = Memory(env, GLOBAL_MEMORY_SIZE, init=0)
         self.compute_graph = compute_graph
         self.schedule_method = schedule_method
@@ -257,7 +284,7 @@ class RISCVMultiprocessor:
     
     def search_overlap(self, addr):
         overlap_list = []
-        for core in self.cores:
+        for core in self.tiles:
             for allocated_addr in core.local_memory.allocate_list:
                 overlap_addr = overlap(allocated_addr, addr)
                 if overlap_addr:
@@ -278,100 +305,102 @@ class RISCVMultiprocessor:
 
     def schedule(self, noc_trace, method='min_traffic'):
         if method == 'min_traffic':
-            core_idx = 0
+            tile_idx = 0
             # Q, K, V projections
             if len(noc_trace) == 0:
                 min_task_num = float('inf')
-                for i, core in enumerate(self.cores):
-                    if core.task_num < min_task_num:
-                        min_task_num = core.task_num
-                        core_idx = i
+                for i, tile in enumerate(self.tiles):
+                    if tile.task_num < min_task_num:
+                        min_task_num = tile.task_num
+                        tile_idx = i
             else:
                 core_size_map = {}
                 for trace in noc_trace:
                     if trace.tile_id is not None:
                         core_size_map[trace.tile_id] = core_size_map.get(trace.tile_id, 0) + trace.addrRes.offset[0] * trace.addrRes.offset[1]
                 max_size = 0
-                for i, core in enumerate(self.cores):
+                for i, core in enumerate(self.tiles):
                     if core.tile_id in core_size_map:
                         size = core_size_map[core.tile_id]
                     else:
                         size = 0
                     if size > max_size:
                         max_size = size
-                        core_idx = i
+                        tile_idx = i
                     elif size == max_size:
-                        if core.task_num < self.cores[core_idx].task_num:
-                            core_idx = i
+                        if core.task_num < self.tiles[tile_idx].task_num:
+                            tile_idx = i
         else:
-            core_idx = 0
+            tile_idx = 0
             # Q, K, V projections
             min_task_num = float('inf')
-            for i, core in enumerate(self.cores):
+            for i, core in enumerate(self.tiles):
                 if core.task_num < min_task_num:
                     min_task_num = core.task_num
-                    core_idx = i
+                    tile_idx = i
 
-        return core_idx
+        return tile_idx
     
-    def execute(self, workload): # workload is a slice of a Matmul or Softmax
+    def execute(self, workload, num_cores): # workload is a slice of a Matmul or Softmax
         workload.complete_event = self.env.event()
         memory_trace, noc_trace = self.analyze_workload(workload)
         for trace in noc_trace:
             yield trace.complete_event
 
         if self.schedule_method == 'min_traffic':
-            core_idx = self.schedule(noc_trace)
+            tile_idx = self.schedule(noc_trace)
         else:
-            core_idx = self.schedule(noc_trace, method='min_idle')
-        self.cores[core_idx].task_num += 1
+            tile_idx = self.schedule(noc_trace, method='min_idle')
+        self.tiles[tile_idx].task_num += 1
         
         for trace in memory_trace:
 
-            with self.cores[core_idx].dma_unit.request() as request:
+            with self.tiles[tile_idx].dma_unit.request() as request:
                 yield request
-                if trace[1] in self.cores[core_idx].local_memory.allocate_list:
+                if trace[1] in self.tiles[tile_idx].local_memory.allocate_list:
                     continue
                 start_time = self.env.now
-                yield self.env.timeout(trace[1].offset[0]*trace[1].offset[1]/1e7)
-                memory_record.append(MemoryTrace(start_time, self.env.now, core_idx, 'load', trace[1]))
-                self.cores[core_idx].local_memory.allocate(trace[1], self.env.now)
+                yield self.env.timeout(trace[1].offset[0]*trace[1].offset[1]/5e7)
+                memory_record.append(MemoryTrace(start_time, self.env.now, tile_idx, 'load', trace[1]))
+                self.tiles[tile_idx].local_memory.allocate(trace[1], self.env.now)
 
         for trace in noc_trace:
-            if trace.tile_id == core_idx:
+            if trace.tile_id == tile_idx:
                 continue
-            with self.cores[core_idx].noc_unit.request() as request:
+            with self.tiles[tile_idx].noc_unit.request() as request:
                 yield request
-                if trace.addrRes in self.cores[core_idx].local_memory.allocate_list:
+                if trace.addrRes in self.tiles[tile_idx].local_memory.allocate_list:
                     continue
                 start_time = self.env.now
                 yield self.env.timeout(trace.addrRes.offset[0]*trace.addrRes.offset[1]/1e8)
-                noc_record.append(NoCTrace(start_time, self.env.now, trace.tile_id, core_idx, 'unicast', trace.addrRes))
-                self.cores[core_idx].local_memory.allocate(trace.addrRes, self.env.now)
+                noc_record.append(NoCTrace(start_time, self.env.now, trace.tile_id, tile_idx, 'unicast', trace.addrRes))
+                self.tiles[tile_idx].local_memory.allocate(trace.addrRes, self.env.now)
 
-        with self.cores[core_idx].compute_unit.request() as request:
+        with self.tiles[tile_idx].compute_unit.request() as request:
             workload.state = 'executing'
             yield request
             start_time = self.env.now
             if isinstance(workload, SliceMatmul):
-                compute_time = gemm_table[(gemm_table['M'] == workload.addrA.offset[1]) &
-                                        (gemm_table['N'] == (workload.addrB.offset[0] if not workload.transpose else workload.addrB.offset[1])) &
-                                        (gemm_table['K'] == workload.addrA.offset[0])]['op_time'].values[0]
+                compute_time = get_gemm_compute_time(workload.addrA.offset[1], (workload.addrB.offset[0] if not workload.transpose else workload.addrB.offset[1]), workload.addrA.offset[0], num_cores)
+                # compute_time = gemm_table[(gemm_table['M'] == workload.addrA.offset[1]) &
+                #                         (gemm_table['N'] == (workload.addrB.offset[0] if not workload.transpose else workload.addrB.offset[1])) &
+                #                         (gemm_table['K'] == workload.addrA.offset[0])]['op_time'].values[0]
             elif isinstance(workload, SliceSoftmax):
-                compute_time = softmax_table[softmax_table['input_size'] == workload.addrIn.offset[0]]['time(nsec)'].values[0]/ 1e9
+                compute_time = get_softmax_compute_time(workload.addrIn.offset[0], num_cores)
+                # compute_time = softmax_table[softmax_table['input_size'] == workload.addrIn.offset[0]]['time(nsec)'].values[0]/ 1e9
             yield self.env.timeout(compute_time)
-            compute_record.append(ComputeTrace(start_time, self.env.now, core_idx, workload))
+            compute_record.append(ComputeTrace(start_time, self.env.now, tile_idx, workload))
             workload.state = 'completed'
-            workload.tile_id = core_idx
-            self.cores[core_idx].local_memory.allocate(workload.addrRes, self.env.now)
-        self.cores[core_idx].task_num -= 1
+            workload.tile_id = tile_idx
+            self.tiles[tile_idx].local_memory.allocate(workload.addrRes, self.env.now)
+        self.tiles[tile_idx].task_num -= 1
         workload.complete_event.succeed()
         if workload.addrRes.annotation == 'Output':
-            with self.cores[core_idx].dma_unit.request() as request:
+            with self.tiles[tile_idx].dma_unit.request() as request:
                 yield request
                 start_time = self.env.now
                 yield self.env.timeout(workload.addrRes.offset[0]*workload.addrRes.offset[1]/1e7)
-                memory_record.append(MemoryTrace(start_time, self.env.now, core_idx, 'store', workload.addrRes))
+                memory_record.append(MemoryTrace(start_time, self.env.now, tile_idx, 'store', workload.addrRes))
 
 RANDOM_SEED = 42
 
@@ -493,39 +522,53 @@ class Attention:
 
 import time
 
-SEQLEN = 512
-DIM = 512
+SEQLEN = 256
+DIM = 256
 
+# SEQLEN = 512
+# DIM = 512
 def dump_event_trace(trace_list, filename, trace_type):
     with open(filename, 'w') as f:
         if trace_type == 'memory':
-            f.write('start_time,end_time,core_idx,type,base1,base2,offset1,offset2\n')
+            f.write('start_time,end_time,tile_idx,type,base1,base2,offset1,offset2\n')
             for trace in trace_list:
-                f.write(f"{trace.start_time},{trace.end_time},{trace.core_idx},{trace.type},"
+                f.write(f"{trace.start_time},{trace.end_time},{trace.tile_idx},{trace.type},"
                         f"{trace.addr.base[0]},{trace.addr.base[1]},"
                         f"{trace.addr.offset[0]},{trace.addr.offset[1]}\n")
         elif trace_type == 'noc':
-            f.write('start_time,end_time,src_core_idx,dest_core_idx,type,base1,base2,offset1,offset2\n')
+            f.write('start_time,end_time,src_tile_idx,dest_tile_idx,type,base1,base2,offset1,offset2\n')
             for trace in trace_list:
-                f.write(f"{trace.start_time},{trace.end_time},{trace.src_core_idx},{trace.dest_core_idx},"
+                f.write(f"{trace.start_time},{trace.end_time},{trace.src_tile_idx},{trace.dest_tile_idx},"
                         f"{trace.type},{trace.addr.base[0]},{trace.addr.base[1]},"
                         f"{trace.addr.offset[0]},{trace.addr.offset[1]}\n")
         else:
-            f.write('start_time,end_time,core_idx,type\n')
+            f.write('start_time,end_time,tile_idx,type\n')
             for trace in trace_list:
                 if isinstance(trace.workload, SliceMatmul):
-                    f.write(f"{trace.start_time},{trace.end_time},{trace.core_idx},matmul\n")
+                    f.write(f"{trace.start_time},{trace.end_time},{trace.tile_idx},matmul\n")
                 elif isinstance(trace.workload, SliceSoftmax):
-                    f.write(f"{trace.start_time},{trace.end_time},{trace.core_idx},softmax\n")
+                    f.write(f"{trace.start_time},{trace.end_time},{trace.tile_idx},softmax\n")
 
 def evaluation(config):
     start = time.time()
     env = simpy.Environment()
     attn = Attention(seqlen=SEQLEN, dim=DIM, config=config)
-    processor = RISCVMultiprocessor(env, num_cores=config['num_cores'], schedule_method=config['schedule_method'], compute_graph=attn.graph)
+    processor = RISCVMultiprocessor(env, num_tiles=config['num_tiles'], schedule_method=config['schedule_method'], compute_graph=attn.graph)
     topological_sort = list(nx.topological_sort(attn.graph))
     for node in topological_sort:
-        env.process(processor.execute(node))
+        if node.addrRes.annotation == 'Q':
+            num_cores = config['proj_q_core_num']
+        elif node.addrRes.annotation == 'K':
+            num_cores = config['proj_k_core_num']
+        elif node.addrRes.annotation == 'V':
+            num_cores = config['proj_v_core_num']
+        elif node.addrRes.annotation == 'QK':
+            num_cores = config['qk_matmul_core_num']
+        elif node.addrRes.annotation == 'Softmax':
+            num_cores = config['softmax_core_num']
+        elif node.addrRes.annotation == 'Output':
+            num_cores = config['qkv_matmul_core_num']
+        env.process(processor.execute(node, num_cores))
     env.run()
     end = time.time()
     return env.now, end - start
@@ -533,12 +576,12 @@ def evaluation(config):
 def draw_gantt_graph(tile_size):
     global memory_record, compute_record, noc_record
 
-    for core_idx in range(8):
+    for tile_idx in range(8):
         fig = plt.figure(figsize=(13, 6))
         ax = fig.add_subplot(111)
-        core_compute_trace = [trace for trace in compute_record if trace.core_idx == core_idx]
-        core_memory_trace = [trace for trace in memory_record if trace.core_idx == core_idx]
-        core_noc_trace = [trace for trace in noc_record if trace.dest_core_idx == core_idx]
+        core_compute_trace = [trace for trace in compute_record if trace.tile_idx == tile_idx]
+        core_memory_trace = [trace for trace in memory_record if trace.tile_idx == tile_idx]
+        core_noc_trace = [trace for trace in noc_record if trace.dest_tile_idx == tile_idx]
         for trace in core_compute_trace:
             if trace.workload.addrRes.annotation == 'Output':
                 ax.barh(0, trace.end_time - trace.start_time, left=trace.start_time, color='blue', label='Softmax(QK^T)*V' if trace == core_compute_trace[0] else "")
@@ -559,9 +602,9 @@ def draw_gantt_graph(tile_size):
         ax.set_xlabel('Time')
         # ax.set_xlim(left=0, right=4000)
         ax.set_ylabel('Core')
-        ax.set_title(f'Gantt Chart of Core {core_idx} Execution')
+        ax.set_title(f'Gantt Chart of Core {tile_idx} Execution')
         ax.set_yticks([0, 1, 2])
-        ax.set_yticklabels([f'Core {core_idx} - Compute', f'Core {core_idx} - Memory', f'Core {core_idx} - NoC'])
+        ax.set_yticklabels([f'Core {tile_idx} - Compute', f'Core {tile_idx} - Memory', f'Core {tile_idx} - NoC'])
         ax.legend(handles=[plt.Line2D([0], [0], color='blue', lw=4),
                            plt.Line2D([0], [0], color='red', lw=4),
                            plt.Line2D([0], [0], color='purple', lw=4),
@@ -572,74 +615,132 @@ def draw_gantt_graph(tile_size):
                            plt.Line2D([0], [0], color='orange', lw=4)],
                   labels=['Softmax(QK^T)*V', 'QK^T', 'Softmax', 'Q Projection', 'K Projection', 'V Projection', 'Memory', 'NoC'], loc='upper left')
         plt.tight_layout()
-        plt.savefig(f'gantt_chart_{tile_size}_core_{core_idx}.png')
+        plt.savefig(f'gantt_chart_{tile_size[0]}_{tile_size[1]}_core_{tile_idx}.png')
         plt.close(fig)
 
 def main():
     global memory_record, noc_record, compute_record
-    tile_sizes = [(32, 32), (64, 64), (96, 96), (128, 128), (160, 160), (192, 192), (224, 224), (256, 256)]
-    num_cores = 8
-    schedule_methods = ['min_traffic', 'min_idle']
-    plt.figure(figsize=(10, 6))
-    for schedule_method in schedule_methods:
-        simulation_times = []
-        for tile_size in tile_sizes:
-            config = {
-                'num_cores': num_cores,
-                'proj_q_tile_size': tile_size,
-                'proj_k_tile_size': tile_size,
-                'proj_v_tile_size': tile_size,
-                'qk_matmul_tile_size': tile_size,
-                'qkv_matmul_tile_size': tile_size,
-                'schedule_method':  schedule_method  # or 'min_idle'
-            }
-            print(f"Running simulation with tile size {tile_size} and {num_cores} cores...")
-            simulation_time, _ = evaluation(config)
-            simulation_times.append((tile_size, simulation_time))
-            # draw_gantt_graph(tile_size)
-            memory_record = []
-            compute_record = []
-            noc_record = []
-
-        # draw line chart
-        plt.plot([size[0][0] for size in simulation_times], [size[1] for size in simulation_times], marker='o', label=f'Schedule: {schedule_method}')
-        # plt.plot([size[0][0] for size in simulation_times], [size[1] for size in simulation_times], marker='o')
-
-    plt.title('Simulation Time vs Tile Size')
-    plt.xlabel('Tile Size (x, y)')
-    plt.ylabel('Simulation Time (seconds)')
-    plt.xticks([size[0][0] for size in simulation_times])
-    plt.legend()
-    plt.grid()
-    # plt.show()
-    plt.savefig('simulation_time_vs_tile_size.png')
-
-    # tile_size = [(64, 64)]
-    # num_cores = [1, 2, 4, 8, 16, 32, 64, 128]
-    # simulation_times = []
-    # for num_core in num_cores:
-    #     config = {
-    #         'num_cores': num_core,
-    #         'proj_q_tile_size': tile_size[0],
-    #         'proj_k_tile_size': tile_size[0],
-    #         'proj_v_tile_size': tile_size[0],
-    #         'qk_matmul_tile_size': tile_size[0],
-    #         'qkv_matmul_tile_size': tile_size[0],
-    #     }
-    #     print(f"Running simulation with tile size {tile_size[0]} and {num_core} cores...")
-    #     simulation_time, _ = evaluation(config)
-    #     simulation_times.append((num_core, simulation_time))
-
-    # # draw histogram
+    # tile_sizes = [(16, 64), (24, 64), (32, 64), (40, 64), (48, 64), (56, 64), (64, 64)]
+    # num_tiles = 8
+    # num_core = 1
+    # schedule_methods = ['min_idle', 'min_traffic']
+    # # schedule_methods = ['min_traffic']
     # plt.figure(figsize=(10, 6))
-    # plt.bar([str(size[0]) for size in simulation_times], [size[1] for size in simulation_times])
-    # plt.title('Simulation Time vs Number of Cores')
-    # plt.xlabel('Number of Cores')
+    # for schedule_method in schedule_methods:
+    #     simulation_times = []
+    #     for tile_size in tile_sizes:
+    #         config = {
+    #             'num_tiles': num_tiles,
+    #             'proj_q_tile_size': tile_size,
+    #             'proj_q_core_num': num_core,
+    #             'proj_k_tile_size': tile_size,
+    #             'proj_k_core_num': num_core,
+    #             'proj_v_tile_size': tile_size,
+    #             'proj_v_core_num': num_core,
+    #             'qk_matmul_tile_size': tile_size,
+    #             'qk_matmul_core_num': num_core,
+    #             'qkv_matmul_tile_size': tile_size,
+    #             'qkv_matmul_core_num': num_core,
+    #             'softmax_core_num': num_core,
+    #             'schedule_method':  schedule_method  # or 'min_idle'
+    #         }
+    #         print(f"Running simulation with tile size {tile_size} and {num_tiles} tiles...")
+    #         simulation_time, _ = evaluation(config)
+    #         simulation_times.append((tile_size, simulation_time))
+    #         # draw_gantt_graph(tile_size)
+    #         memory_record = []
+    #         compute_record = []
+    #         noc_record = []
+
+    #     plt.plot([size[0][0] for size in simulation_times], [size[1] for size in simulation_times], marker='o', label=f'Schedule: {schedule_method}')
+
+    # plt.title('Simulation Time vs Tile Size')
+    # plt.xlabel('Tile Size (x, y)')
     # plt.ylabel('Simulation Time (seconds)')
-    # plt.xticks(rotation=45)
-    # plt.grid(axis='y')
-    # # plt.show()
+    # plt.xticks([size[0][0] for size in simulation_times])
+    # plt.legend()
+    # plt.grid()
+    # plt.savefig('simulation_time_vs_tile_size.png')
+
+    # tile_sizes = [(16, 64), (24, 64), (32, 64), (40, 64), (48, 64), (56, 64), (64, 64)]
+    # num_tiles = 8
+    # num_cores = [1, 2, 4]
+    # schedule_methods = ['min_idle', 'min_traffic']
+    # tile_size = (32, 64)
+    # # schedule_methods = ['min_traffic']
+    # plt.figure(figsize=(10, 6))
+    # for schedule_method in schedule_methods:
+    #     simulation_times = []
+    #     for num_core in num_cores:
+    #         config = {
+    #             'num_tiles': num_tiles,
+    #             'proj_q_tile_size': tile_size,
+    #             'proj_q_core_num': num_core,
+    #             'proj_k_tile_size': tile_size,
+    #             'proj_k_core_num': num_core,
+    #             'proj_v_tile_size': tile_size,
+    #             'proj_v_core_num': num_core,
+    #             'qk_matmul_tile_size': tile_size,
+    #             'qk_matmul_core_num': num_core,
+    #             'qkv_matmul_tile_size': tile_size,
+    #             'qkv_matmul_core_num': num_core,
+    #             'softmax_core_num': num_core,
+    #             'schedule_method':  schedule_method  # or 'min_idle'
+    #         }
+    #         print(f"Running simulation with tile size {tile_size} and {num_tiles} tiles...")
+    #         simulation_time, _ = evaluation(config)
+    #         simulation_times.append((num_core, simulation_time))
+    #         # draw_gantt_graph(tile_size)
+    #         memory_record = []
+    #         compute_record = []
+    #         noc_record = []
+
+    #     plt.plot([size[0] for size in simulation_times], [size[1] for size in simulation_times], marker='o', label=f'Schedule: {schedule_method}')
+    #     # plt.plot([size[0][0] for size in simulation_times], [size[1] for size in simulation_times], marker='o', label=f'Schedule: {schedule_method}')
+ 
+    # plt.title('Simulation Time vs Number of Cores')
+    # plt.xlabel('Core num')
+    # plt.ylabel('Simulation Time (seconds)')
+    # plt.xticks([size[0] for size in simulation_times]) 
+    # plt.legend()
+    # plt.grid()
     # plt.savefig('simulation_time_vs_num_cores.png')
+
+
+    tile_size = [(32, 64)]
+    num_cores = [1, 2, 4, 8, 16, 32, 64, 128]
+    simulation_times = []
+    num_core = 1
+    for num_tile in num_cores:
+        config = {
+            'num_tiles': num_tile,
+            'proj_q_tile_size': tile_size[0],
+            'proj_q_core_num': num_core,
+            'proj_k_tile_size': tile_size[0],
+            'proj_k_core_num': num_core,
+            'proj_v_tile_size': tile_size[0],
+            'proj_v_core_num': num_core,
+            'qk_matmul_tile_size': tile_size[0],
+            'qk_matmul_core_num': num_core,
+            'qkv_matmul_tile_size': tile_size[0],
+            'qkv_matmul_core_num': num_core,
+            'softmax_core_num': num_core,
+            'schedule_method': 'min_traffic'
+        }
+        print(f"Running simulation with tile size {tile_size[0]} and {num_tile} tiles...")
+        simulation_time, _ = evaluation(config)
+        simulation_times.append((num_tile, simulation_time))
+
+    # draw histogram
+    plt.figure(figsize=(10, 6))
+    plt.bar([str(size[0]) for size in simulation_times], [size[1] for size in simulation_times])
+    plt.title('Simulation Time vs Number of Tiles')
+    plt.xlabel('Number of Tiles')
+    plt.ylabel('Simulation Time (seconds)')
+    plt.xticks(rotation=45)
+    plt.grid(axis='y')
+    # plt.show()
+    plt.savefig('simulation_time_vs_num_tiles.png')
 
 
 if __name__ == "__main__":
